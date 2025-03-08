@@ -593,10 +593,15 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
+        # Filter out kwargs that are not expected by the encoder
+        encoder_supported_args = inspect.signature(self.encoder.forward).parameters
+        encoder_kwargs = {argument: value for argument, value in kwargs.items() 
+                         if not argument.startswith("decoder_") and argument in encoder_supported_args}
 
-        kwargs_decoder = {
-            argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
+        decoder_supported_args = inspect.signature(self.decoder.forward).parameters
+        decoder_kwargs = {
+            argument[len("decoder_") :]: value for argument, value in kwargs.items() 
+            if argument.startswith("decoder_") and argument[len("decoder_"):] in decoder_supported_args
         }
 
         if encoder_outputs is None:
@@ -607,7 +612,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                **kwargs_encoder,
+                **encoder_kwargs,
             )
         elif isinstance(encoder_outputs, tuple):
             encoder_outputs = BaseModelOutput(*encoder_outputs)
@@ -640,7 +645,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             past_key_values=past_key_values,
             return_dict=return_dict,
-            **kwargs_decoder,
+            **decoder_kwargs,
         )
 
         # Compute loss independent from decoder (as some shift the logits inside them)
