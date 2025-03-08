@@ -29,8 +29,8 @@ from ...generation import GenerationMixin
 from ...modeling_attn_mask_utils import AttentionMaskConverter
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
@@ -129,7 +129,7 @@ class LlamaRotaryEmbedding(nn.Module):
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
@@ -217,7 +217,7 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
+    if (attention_mask is not None) and (not module.is_cross_attention):
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
@@ -232,7 +232,7 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, is_cross_attention=False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -240,17 +240,29 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.is_causal = True
+        self.is_causal = not is_cross_attention  # Cross-attention is not causal
+        self.is_cross_attention = is_cross_attention
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
+        
+        # For cross-attention, separate q_proj and kv_proj like in GPT2
+        if is_cross_attention:
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+        else:
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+        
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -262,23 +274,42 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        
+        if self.is_cross_attention and encoder_hidden_states is not None:
+            # Cross-attention: q from hidden_states, k/v from encoder_hidden_states
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(encoder_hidden_states).view(
+                encoder_hidden_states.size(0), encoder_hidden_states.size(1), -1, self.head_dim).transpose(1, 2)
+            value_states = self.v_proj(encoder_hidden_states).view(
+                encoder_hidden_states.size(0), encoder_hidden_states.size(1), -1, self.head_dim).transpose(1, 2)
+            
+            # Use encoder_attention_mask for cross-attention
+            if encoder_attention_mask is not None:
+                attention_mask = encoder_attention_mask
+        else:
+            # Self-attention: q, k, v all from hidden_states
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Apply rotary embeddings only for self-attention
+        if not self.is_cross_attention:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position} if not self.is_cross_attention else {}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # For self-attention: Use the existing attention_interface
+        # For cross-attention: We can use eager_attention_forward directly
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -309,8 +340,45 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.layer_idx = layer_idx
+        
+        # Self-attention
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        
+        # Cross-attention (conditionally created based on configuration)
+        self.cross_attention = None
+        
+        # Add cross-attention only to specific layers based on config
+        add_cross_attn_to_this_layer = False
+        cross_attention_frequency = 4
+        if getattr(config, "add_cross_attention", False):
+            # Option 1: Add to specific frequency (e.g., every 4th layer)
+            if cross_attention_frequency > 0 and layer_idx % cross_attention_frequency == 0:
+                add_cross_attn_to_this_layer = True
+            
+            # # Option 2: Add to specific layer indices
+            # elif hasattr(config, "cross_attention_layers") and config.cross_attention_layers is not None:
+            #     if layer_idx in config.cross_attention_layers:
+            #         add_cross_attn_to_this_layer = True
+            
+            # # Option 3: Add to first N layers
+            # elif hasattr(config, "cross_attention_first_n") and config.cross_attention_first_n is not None:
+            #     if layer_idx < config.cross_attention_first_n:
+            #         add_cross_attn_to_this_layer = True
+                    
+            # # Option 4: Add to last N layers
+            # elif hasattr(config, "cross_attention_last_n") and config.cross_attention_last_n is not None:
+            #     if layer_idx >= config.num_hidden_layers - config.cross_attention_last_n:
+            #         add_cross_attn_to_this_layer = True
+            
+            # Default behavior: add to all layers if no specific configuration is provided
+            else:
+                add_cross_attn_to_this_layer = False
+            
+            # Create cross-attention components if needed for this layer
+            if add_cross_attn_to_this_layer:
+                self.cross_attention = LlamaAttention(config=config, layer_idx=layer_idx, is_cross_attention=True)
+                self.cross_attention_layer_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -325,7 +393,9 @@ class LlamaDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -346,16 +416,41 @@ class LlamaDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        # Cross-Attention Block (if enabled for this specific layer)
+        if self.cross_attention is not None and encoder_hidden_states is not None:
+            residual = hidden_states
+            hidden_states = self.cross_attention_layer_norm(hidden_states)
+            
+            # Cross-Attention
+            hidden_states, cross_attn_weights = self.cross_attention(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+                position_embeddings=position_embeddings,  # Passed but not used for cross-attn
+                **kwargs,
+            )
+            hidden_states = residual + hidden_states
+            outputs = (hidden_states,)
+            
+            if output_attentions:
+                outputs += (self_attn_weights, cross_attn_weights)
+        else:
+            outputs = (hidden_states,)
+            if output_attentions:
+                outputs += (self_attn_weights,)
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
+        if not output_attentions:
+            outputs = (hidden_states,)
+            
         return outputs
 
 
@@ -528,8 +623,10 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -573,6 +670,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -589,6 +687,8 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -600,6 +700,8 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                     **flash_attn_kwargs,
                 )
 
@@ -607,6 +709,11 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+                
+                # If cross attention was used and output_attentions is True,
+                # capture cross-attention weights
+                if encoder_hidden_states is not None and len(layer_outputs) > 2:
+                    all_cross_attentions += (layer_outputs[2],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -614,11 +721,12 @@ class LlamaModel(LlamaPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        output = BaseModelOutputWithPast(
+        output = BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            cross_attentions=all_cross_attentions,
         )
         return output if return_dict else output.to_tuple()
 
@@ -783,7 +891,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=CausalLMOutputWithCrossAttentions, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -798,9 +906,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        encoder_hidden_states: Optional[torch.Tensor] = None, 
+        encoder_attention_mask: Optional[torch.Tensor] = None, 
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         r"""
+        Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
@@ -849,6 +960,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
             **kwargs,
         )
 
@@ -865,12 +978,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
         )
 
 

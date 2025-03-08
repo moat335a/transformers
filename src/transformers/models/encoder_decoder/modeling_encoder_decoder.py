@@ -685,3 +685,92 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
 
 
 __all__ = ["EncoderDecoderModel"]
+
+def test_model(encoder_name="answerdotai/ModernBERT-large", decoder_name="HuggingFaceTB/SmolLM2-360M-Instruct"):
+    """
+    Test function to check if the EncoderDecoderModel works as expected.
+    
+    Args:
+        encoder_name (str): Pretrained encoder model name or path
+        decoder_name (str): Pretrained decoder model name or path
+    """
+    from transformers import AutoTokenizer
+    import torch
+    
+    # Initialize the model
+    model = EncoderDecoderModel.from_encoder_decoder_pretrained(
+        encoder_name, decoder_name
+    )
+    
+    # Set decoding parameters
+    model.config.decoder_start_token_id = model.config.decoder.bos_token_id
+    model.config.pad_token_id = model.config.decoder.pad_token_id
+    model.config.eos_token_id = model.config.decoder.eos_token_id
+    
+    # Initialize tokenizers
+    encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_name)
+    decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name)
+    
+    # Ensure the decoder has a pad token
+    if decoder_tokenizer.pad_token_id is None:
+        decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+    
+    # Create dummy inputs
+    encoder_text = ["This is a test input for the encoder."]
+    decoder_text = ["This is a test output for the decoder."]
+    
+    # Tokenize
+    encoder_inputs = encoder_tokenizer(
+        encoder_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=16
+    )
+    
+    decoder_inputs = decoder_tokenizer(
+        decoder_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=16
+    )
+    
+    # Show tokenized inputs
+    print(f"Encoder tokens: {encoder_inputs.input_ids.shape}")
+    print(f"Decoder tokens: {decoder_inputs.input_ids.shape}")
+    
+    # Forward pass with labels to check loss calculation
+    with torch.no_grad():
+        outputs = model(
+            input_ids=encoder_inputs.input_ids,
+            attention_mask=encoder_inputs.attention_mask,
+            decoder_input_ids=decoder_inputs.input_ids,
+            decoder_attention_mask=decoder_inputs.attention_mask,
+            labels=decoder_inputs.input_ids
+        )
+    
+    # Show results
+    print(f"Loss: {outputs.loss.item():.4f}")
+    print(f"Logits shape: {outputs.logits.shape}")
+    
+    # Try generation
+    print("\nTesting generation...")
+    generated_ids = model.generate(
+        encoder_inputs.input_ids,
+        attention_mask=encoder_inputs.attention_mask,
+        max_length=20,
+        num_beams=4,
+        early_stopping=True
+    )
+    
+    # Decode the generated ids
+    generated_text = decoder_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    print(f"Input: {encoder_text[0]}")
+    print(f"Generated output: {generated_text}")
+    
+    # Return model for further inspection if needed
+    return model
+
+if __name__ == "__main__":
+    test_model()

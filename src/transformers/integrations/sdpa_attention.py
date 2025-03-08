@@ -31,8 +31,10 @@ def sdpa_attention_forward(
         value = repeat_kv(value, module.num_key_value_groups)
 
     causal_mask = attention_mask
-    if attention_mask is not None:
+    if (attention_mask is not None) and (not module.is_cross_attention):
         causal_mask = causal_mask[:, :, :, : key.shape[-2]]
+    elif (attention_mask is not None) and (module.is_cross_attention):
+        causal_mask = causal_mask[:,None,None,:]
 
     # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -55,7 +57,7 @@ def sdpa_attention_forward(
         query,
         key,
         value,
-        attn_mask=causal_mask,
+        attn_mask=causal_mask.bool() if causal_mask is not None else None,
         dropout_p=dropout,
         scale=scaling,
         is_causal=is_causal,

@@ -21,6 +21,12 @@
 
 from ...configuration_utils import PretrainedConfig
 from ...modeling_rope_utils import rope_config_validation
+from ...utils import logging
+
+
+logger = logging.get_logger(__name__)
+
+LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
 class LlamaConfig(PretrainedConfig):
@@ -125,6 +131,18 @@ class LlamaConfig(PretrainedConfig):
             Whether to use a bias in up_proj, down_proj and gate_proj layers in the MLP layers.
         head_dim (`int`, *optional*):
             The attention head dimension. If None, it will default to hidden_size // num_attention_heads
+        add_cross_attention (`bool`, *optional*, defaults to `False`):
+            Whether to add cross-attention between encoder and decoder. This is used in encoder-decoder models.
+        
+        # New parameters for controlling which layers get cross-attention
+        cross_attention_frequency (`int`, *optional*):
+            If set, add cross-attention to every Nth layer (e.g., 4 means every 4th layer gets cross-attention)
+        cross_attention_layers (`List[int]`, *optional*):
+            If set, add cross-attention only to the layers with indices in this list
+        cross_attention_first_n (`int`, *optional*):
+            If set, add cross-attention only to the first N layers
+        cross_attention_last_n (`int`, *optional*):
+            If set, add cross-attention only to the last N layers
 
     ```python
     >>> from transformers import LlamaModel, LlamaConfig
@@ -181,6 +199,13 @@ class LlamaConfig(PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        _attn_implementation="eager",
+        # Cross-attention parameters
+        add_cross_attention=False,
+        cross_attention_frequency=None,
+        cross_attention_layers=None,
+        cross_attention_first_n=None,
+        cross_attention_last_n=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -211,6 +236,32 @@ class LlamaConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
+
+        # Parameters for cross-attention
+        self.add_cross_attention = add_cross_attention
+        
+        # New parameters for controlling cross-attention layer placement
+        self.cross_attention_frequency = cross_attention_frequency
+        self.cross_attention_layers = cross_attention_layers
+        self.cross_attention_first_n = cross_attention_first_n
+        self.cross_attention_last_n = cross_attention_last_n
+
+        # Validate cross-attention layer parameters
+        if add_cross_attention and sum(
+            param is not None for param in [
+                cross_attention_frequency, 
+                cross_attention_layers, 
+                cross_attention_first_n, 
+                cross_attention_last_n
+            ]
+        ) > 1:
+            logger.warning(
+                "Multiple cross-attention placement strategies specified. "
+                "Priority: layers > frequency > first_n > last_n"
+            )
+
+        # For SDPA
+        self._attn_implementation = _attn_implementation
 
         super().__init__(
             pad_token_id=pad_token_id,
