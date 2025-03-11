@@ -593,13 +593,14 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
         >>> # generation
         >>> generated = model.generate(input_ids)
         ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict  
+        encoder_kwargs = {argument: value for argument, value in kwargs.items() 
+                          if not argument.startswith("encoder_") }
 
-        kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
 
-        kwargs_decoder = {
-            argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
-        }
+        decoder_kwargs = {
+             argument[len("decoder_") :]: value for argument, value in kwargs.items() 
+             if argument.startswith("decoder_") }
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -609,7 +610,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                **kwargs_encoder,
+                **encoder_kwargs,
             )
         elif isinstance(encoder_outputs, tuple):
             encoder_outputs = BaseModelOutput(*encoder_outputs)
@@ -619,7 +620,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
         # optionally project encoder_hidden_states
         if (
             self.encoder.config.hidden_size != self.decoder.config.hidden_size
-            and self.decoder.config.cross_attention_hidden_size is None
+            and self.decoder.config.cross_attention_input_dim is None
         ):
             encoder_hidden_states = self.enc_to_dec_proj(encoder_hidden_states)
 
@@ -642,7 +643,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             past_key_values=past_key_values,
             return_dict=return_dict,
-            **kwargs_decoder,
+            **decoder_kwargs,
         )
 
         # Compute loss independent from decoder (as some shift the logits inside them)
@@ -687,3 +688,92 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
 
 
 __all__ = ["EncoderDecoderModel"]
+
+def test_model(encoder_name="answerdotai/ModernBERT-large", decoder_name="HuggingFaceTB/SmolLM2-360M-Instruct"):
+     """
+     Test function to check if the EncoderDecoderModel works as expected.
+     
+     Args:
+         encoder_name (str): Pretrained encoder model name or path
+         decoder_name (str): Pretrained decoder model name or path
+     """
+     from transformers import AutoTokenizer
+     import torch
+     
+     # Initialize the model
+     model = EncoderDecoderModel.from_encoder_decoder_pretrained(
+         encoder_name, decoder_name
+     )
+     
+     # Set decoding parameters
+     model.config.decoder_start_token_id = model.config.decoder.bos_token_id
+     model.config.pad_token_id = model.config.decoder.pad_token_id
+     model.config.eos_token_id = model.config.decoder.eos_token_id
+     
+     # Initialize tokenizers
+     encoder_tokenizer = AutoTokenizer.from_pretrained(encoder_name)
+     decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name)
+     
+     # Ensure the decoder has a pad token
+     if decoder_tokenizer.pad_token_id is None:
+         decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+     
+     # Create dummy inputs
+     encoder_text = ["This is a test input for the encoder."]
+     decoder_text = ["This is a test output for the decoder."]
+     
+     # Tokenize
+     encoder_inputs = encoder_tokenizer(
+         encoder_text,
+         return_tensors="pt",
+         padding=True,
+         truncation=True,
+         max_length=16
+     )
+     
+     decoder_inputs = decoder_tokenizer(
+         decoder_text,
+         return_tensors="pt",
+         padding=True,
+         truncation=True,
+         max_length=16
+     )
+     
+     # Show tokenized inputs
+     print(f"Encoder tokens: {encoder_inputs.input_ids.shape}")
+     print(f"Decoder tokens: {decoder_inputs.input_ids.shape}")
+     
+     # Forward pass with labels to check loss calculation
+     with torch.no_grad():
+         outputs = model(
+             input_ids=encoder_inputs.input_ids,
+             attention_mask=encoder_inputs.attention_mask,
+             decoder_input_ids=decoder_inputs.input_ids,
+             decoder_attention_mask=decoder_inputs.attention_mask,
+             labels=decoder_inputs.input_ids
+         )
+     
+     # Show results
+     print(f"Loss: {outputs.loss.item():.4f}")
+     print(f"Logits shape: {outputs.logits.shape}")
+     
+     # Try generation
+     print("\nTesting generation...")
+     generated_ids = model.generate(
+         encoder_inputs.input_ids,
+         attention_mask=encoder_inputs.attention_mask,
+         max_length=20,
+         num_beams=4,
+         early_stopping=True
+     )
+     
+     # Decode the generated ids
+     generated_text = decoder_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+     print(f"Input: {encoder_text[0]}")
+     print(f"Generated output: {generated_text}")
+     
+     # Return model for further inspection if needed
+     return model
+ 
+if __name__ == "__main__":
+     test_model()
