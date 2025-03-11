@@ -247,13 +247,13 @@ class LlamaAttention(nn.Module):
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
         
-        # For cross-attention, separate q_proj and kv_proj like in GPT2
+
         if is_cross_attention:
             self.k_proj = nn.Linear(
-                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                config.cross_attention_input_dim, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
             )
             self.v_proj = nn.Linear(
-                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                config.cross_attention_input_dim, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
             )
         else:
             self.k_proj = nn.Linear(
