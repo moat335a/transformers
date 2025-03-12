@@ -14,12 +14,13 @@
 # limitations under the License.
 """Classes to support Encoder-Decoder architectures"""
 
-import gc
+import json
 import inspect
 import os
 import tempfile
 import warnings
 from typing import Optional, Tuple, Union
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -297,103 +298,102 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         r"""
-        Example:
-
-        ```python
-        >>> from transformers import EncoderDecoderModel
-
-        >>> model = EncoderDecoderModel.from_pretrained("patrickvonplaten/bert2bert-cnn_dailymail-fp16")
-        ```"""
-
-        from_tf = kwargs.pop("from_tf", False)
-        if from_tf:
-            from transformers import TFEncoderDecoderModel
-
-            # a workaround to load from tensorflow checkpoint
-            # Using `_tf_model` won't work, because the weight names in the encoder/decoder of `_tf_model` get
-            # extended before saving those components. For example, The name of `_tf_model.encoder.vit` is
-            # `[top model name]/encoder/vit`, but the name of `tf_model.encoder.vit` is `[top model name]/vit`. The
-            # [top model name] is handled (stripped) by the conversion method, and the former case gets extra `encoder`,
-            # which should not occur when we want to save the components alone.
-            # There was a (very) ugly potential fix, which wasn't integrated to `transformers`: see
-            #   https://github.com/huggingface/transformers/pull/13222/commits/dbb3c9de76eee235791d2064094654637c99f36d#r697304245
-            #   (the change in `src/transformers/modeling_tf_utils.py`)
-            _tf_model = TFEncoderDecoderModel.from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-            config = _tf_model.config
-
-            # Using `tf_model` instead
-            encoder = _tf_model.encoder.__class__(_tf_model.config.encoder)
-            decoder = _tf_model.decoder.__class__(_tf_model.config.decoder)
-            # Make sure models are built
-            encoder(encoder.dummy_inputs)
-            decoder(decoder.dummy_inputs)
-
-            # Get the variable correspondence between `_tf_model` and `encoder` and `decoder`
-            encoder_variables = {}
-            for v in encoder.trainable_variables + encoder.non_trainable_variables:
-                encoder_variables["/".join(v.name.split("/")[1:])] = v
-            decoder_variables = {}
-            for v in decoder.trainable_variables + decoder.non_trainable_variables:
-                decoder_variables["/".join(v.name.split("/")[1:])] = v
-
-            _encoder_variables = {}
-            for v in _tf_model.encoder.trainable_variables + _tf_model.encoder.non_trainable_variables:
-                _encoder_variables["/".join(v.name.split("/")[2:])] = v
-            _decoder_variables = {}
-            for v in _tf_model.decoder.trainable_variables + _tf_model.decoder.non_trainable_variables:
-                _decoder_variables["/".join(v.name.split("/")[2:])] = v
-
-            # assign weight values to `encoder` and `decoder` from `_tf_model`
-            for name, v in encoder_variables.items():
-                v.assign(_encoder_variables[name])
-            for name, v in decoder_variables.items():
-                v.assign(_decoder_variables[name])
-
-            tf_model = TFEncoderDecoderModel(encoder=encoder, decoder=decoder)
-
-            # Deal with `enc_to_dec_proj`
-            if hasattr(_tf_model, "enc_to_dec_proj"):
-                tf_model(tf_model.dummy_inputs)
-                tf_model.enc_to_dec_proj.kernel.assign(_tf_model.enc_to_dec_proj.kernel)
-                tf_model.enc_to_dec_proj.bias.assign(_tf_model.enc_to_dec_proj.bias)
-
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                encoder_dir = os.path.join(tmpdirname, "encoder")
-                decoder_dir = os.path.join(tmpdirname, "decoder")
-                tf_model.encoder.save_pretrained(encoder_dir)
-                tf_model.decoder.save_pretrained(decoder_dir)
-
-                if hasattr(tf_model, "enc_to_dec_proj"):
-                    enc_to_dec_proj_weight = torch.transpose(
-                        torch.from_numpy(tf_model.enc_to_dec_proj.kernel.numpy()), 1, 0
-                    )
-                    enc_to_dec_proj_bias = torch.from_numpy(tf_model.enc_to_dec_proj.bias.numpy())
-
-                del _tf_model
-                del tf_model
-                gc.collect()
-
-                model = EncoderDecoderModel.from_encoder_decoder_pretrained(
-                    encoder_dir, decoder_dir, encoder_from_tf=True, decoder_from_tf=True
-                )
-                # This is only for copying some specific attributes of this particular model.
-                model.config = config
-
+        Load a pretrained EncoderDecoderModel from either:
+        - a previously saved EncoderDecoderModel with encoder/decoder saved separately
+        - a standard pretrained EncoderDecoderModel saved as a single model
+        """
+        # Check if path exists and contains separate encoder/decoder directories
+        path = Path(pretrained_model_name_or_path)
+        encoder_dir = path / "encoder"
+        decoder_dir = path / "decoder"
+        config = AutoConfig.from_pretrained(path)
+        config.decoder.add_cross_attention= True
+        json_path = path / "config.json"
+        if json_path.exists():
+            json_config = json.loads(json_path.read_text())
+            decoder_name = json_config["decoder"]["_name_or_path"]
+            encoder_name = json_config["encoder"]["_name_or_path"]
+                
+        
+        # If we have separate encoder/decoder directories, use them
+        if os.path.isdir(pretrained_model_name_or_path) and encoder_dir.exists() and decoder_dir.exists():
+            logger.info(f"Loading encoder from {encoder_dir} and decoder from {decoder_dir}")
+                
+            # Load encoder and decoder
+            encoder_kwargs = {
+                argument[len("encoder_") :]: value for argument, value in kwargs.items() 
+                if argument.startswith("encoder_")
+            }
+            decoder_kwargs = {
+                argument[len("decoder_") :]: value for argument, value in kwargs.items() 
+                if argument.startswith("decoder_")
+            }
+            
+            # Create the model instance with loaded encoder and decoder
+            from ..auto.modeling_auto import AutoModel, AutoModelForCausalLM
+            
+            encoder = AutoModel.from_pretrained(encoder_dir,config=config.encoder, *model_args, **encoder_kwargs)
+            decoder = AutoModelForCausalLM.from_pretrained(decoder_name,config=config.decoder, **decoder_kwargs)
+            decoder.load_adapter(decoder_dir)
+            model = cls(config=config, encoder=encoder, decoder=decoder)
+            
+            # Load projection layer if it exists
+            proj_file = path / "enc_to_dec_proj.safetensors"
+            bin_file = path / "enc_to_dec_proj.bin"
+            
+            if proj_file.exists():
+                from safetensors.torch import load_file
+                state_dict = load_file(proj_file)
                 if hasattr(model, "enc_to_dec_proj"):
-                    model.enc_to_dec_proj.weight.data = enc_to_dec_proj_weight.contiguous()
-                    model.enc_to_dec_proj.bias.data = enc_to_dec_proj_bias.contiguous()
-
-                return model
-
-        # At the moment fast initialization is not supported for composite models
-        if kwargs.get("_fast_init", False):
-            logger.warning(
-                "Fast initialization is currently not supported for EncoderDecoderModel. "
-                "Falling back to slow initialization..."
-            )
-        kwargs["_fast_init"] = False
-
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+                    model.enc_to_dec_proj.weight.data = state_dict["weight"]
+                    model.enc_to_dec_proj.bias.data = state_dict["bias"]
+            elif bin_file.exists():
+                state_dict = torch.load(bin_file, map_location="cpu")
+                if hasattr(model, "enc_to_dec_proj"):
+                    model.enc_to_dec_proj.weight.data = state_dict["weight"]
+                    model.enc_to_dec_proj.bias.data = state_dict["bias"]
+                    
+            return model
+            
+            
+    
+    def save_pretrained(self, save_directory, safe_serialization=True, **kwargs):
+        """
+        Save encoder and decoder components separately.
+        
+        Args:
+            save_directory: Directory where to save encoder and decoder
+            safe_serialization: Whether to use safe serialization
+            **kwargs: Additional arguments to pass to the save_pretrained methods
+        """
+        save_directory = Path(save_directory)
+        save_directory.mkdir(exist_ok=True, parents=True)
+        
+        # Create subdirectories for encoder and decoder
+        encoder_dir = save_directory / "encoder"
+        decoder_dir = save_directory / "decoder"
+        
+        # Save encoder and decoder using their own methods
+        self.encoder.save_pretrained(encoder_dir, safe_serialization=safe_serialization, **kwargs)
+        self.decoder.save_pretrained(decoder_dir, safe_serialization=safe_serialization, **kwargs)
+        
+        # Save the main model's config
+        self.config.save_pretrained(save_directory)
+        
+        # If there's an encoder-to-decoder projection layer, save it separately
+        if hasattr(self, "enc_to_dec_proj"):
+            if safe_serialization:
+                from safetensors.torch import save_file
+                save_file({"weight": self.enc_to_dec_proj.weight, 
+                        "bias": self.enc_to_dec_proj.bias}, 
+                        save_directory / "enc_to_dec_proj.safetensors")
+            else:
+                torch.save(
+                    {"weight": self.enc_to_dec_proj.weight, "bias": self.enc_to_dec_proj.bias},
+                    save_directory / "enc_to_dec_proj.bin"
+                )
+        
+        return [save_directory, encoder_dir, decoder_dir]
 
     @classmethod
     def from_encoder_decoder_pretrained(
