@@ -308,6 +308,7 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
         decoder_dir = path / "decoder"
         config = AutoConfig.from_pretrained(path)
         config.decoder.add_cross_attention= True
+        lora = True if (os.path.isfile(encoder_dir / "adapter_config.json") and os.path.isfile(decoder_dir / "adapter_config.json")) else False
         json_path = path / "config.json"
         if json_path.exists():
             json_config = json.loads(json_path.read_text())
@@ -331,10 +332,13 @@ class EncoderDecoderModel(PreTrainedModel, GenerationMixin):
             
             # Create the model instance with loaded encoder and decoder
             from ..auto.modeling_auto import AutoModel, AutoModelForCausalLM
-            
-            encoder = AutoModel.from_pretrained(encoder_dir,config=config.encoder, *model_args, **encoder_kwargs)
-            decoder = AutoModelForCausalLM.from_pretrained(decoder_name,config=config.decoder, **decoder_kwargs)
-            decoder.load_adapter(decoder_dir)
+            if lora:
+                encoder = AutoModel.from_pretrained(encoder_dir,config=config.encoder, *model_args, **encoder_kwargs)
+                decoder = AutoModelForCausalLM.from_pretrained(decoder_name,config=config.decoder, **decoder_kwargs)
+                decoder.load_adapter(decoder_dir)
+            else:
+                encoder = AutoModel.from_pretrained(encoder_dir,config=config.encoder, *model_args, **encoder_kwargs)
+                decoder = AutoModelForCausalLM.from_pretrained(decoder_dir,config=config.decoder, **decoder_kwargs)
             model = cls(config=config, encoder=encoder, decoder=decoder)
             
             # Load projection layer if it exists
